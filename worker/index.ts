@@ -1,3 +1,244 @@
+// Flashing Studio for your existing flashing-drawing-model Worker.
+// Paste this ENTIRE file into Edit code, replacing the current contents.
+// Preserves MyWorkflow, WorkflowStatusDO and the existing workflow routes.
+// Keep your existing bindings. Enable workers.dev in the Domains tab to open the app.
+
+import { WorkflowEntrypoint, DurableObject } from "cloudflare:workers";
+class MyWorkflow extends WorkflowEntrypoint {
+  async run(event, step) {
+    const instanceId = event.instanceId;
+    const notifyStep = async (stepName, status) => {
+      try {
+        const doId = this.env.WORKFLOW_STATUS.idFromName(instanceId);
+        const stub = this.env.WORKFLOW_STATUS.get(doId);
+        await stub.updateStep(stepName, status);
+      } catch {
+      }
+    };
+    await notifyStep("process data", "running");
+    const result = await step.do("process data", async () => {
+      await new Promise((resolve) => setTimeout(resolve, 1e3));
+      return { processed: true, timestamp: Date.now() };
+    });
+    await notifyStep("process data", "completed");
+    await notifyStep("wait 2 seconds", "running");
+    await step.sleep("wait 2 seconds", "2 seconds");
+    await notifyStep("wait 2 seconds", "completed");
+    await notifyStep("wait for approval", "waiting");
+    const approval = await step.waitForEvent("wait for approval", {
+      type: "user-approval",
+      timeout: "60 minutes"
+    });
+    await notifyStep("wait for approval", "completed");
+    await notifyStep("final", "running");
+    await step.do("final", async () => {
+      console.log("Results:", { result, approval: approval.payload });
+      await new Promise((resolve) => setTimeout(resolve, 1e3));
+    });
+    await notifyStep("final", "completed");
+  }
+}
+class WorkflowStatusDO extends DurableObject {
+  stepStatuses;
+  currentStep;
+  workflowStatus;
+  constructor(ctx, env) {
+    super(ctx, env);
+    this.stepStatuses = /* @__PURE__ */ new Map();
+    this.currentStep = null;
+    this.workflowStatus = "running";
+    ctx.blockConcurrencyWhile(async () => {
+      const storedStatuses = await ctx.storage.get("stepStatuses");
+      const storedCurrent = await ctx.storage.get("currentStep");
+      const storedWorkflowStatus = await ctx.storage.get("workflowStatus");
+      if (storedStatuses) {
+        this.stepStatuses = new Map(Object.entries(storedStatuses));
+      } else {
+        const steps = [
+          "process data",
+          "wait 2 seconds",
+          "wait for approval",
+          "final"
+        ];
+        steps.forEach((s) => this.stepStatuses.set(s, "pending"));
+      }
+      this.currentStep = storedCurrent ?? null;
+      this.workflowStatus = storedWorkflowStatus ?? "running";
+    });
+  }
+  async fetch(request) {
+    if (request.headers.get("Upgrade") === "websocket") {
+      const pair = new WebSocketPair();
+      const [client, server] = Object.values(pair);
+      this.ctx.acceptWebSocket(server);
+      server.send(JSON.stringify(this.getStateMessage()));
+      return new Response(null, { status: 101, webSocket: client });
+    }
+    return new Response("Expected WebSocket", { status: 400 });
+  }
+  /**
+   * RPC method called by the workflow to update step status
+   * This is called via stub.updateStep() from the workflow
+   */
+  async updateStep(stepName, status) {
+    this.stepStatuses.set(stepName, status);
+    if (status === "running" || status === "waiting") {
+      this.currentStep = stepName;
+    }
+    const allCompleted = Array.from(this.stepStatuses.values()).every(
+      (s) => s === "completed"
+    );
+    if (allCompleted) {
+      this.workflowStatus = "completed";
+      this.currentStep = null;
+    }
+    await this.ctx.storage.put(
+      "stepStatuses",
+      Object.fromEntries(this.stepStatuses)
+    );
+    await this.ctx.storage.put("currentStep", this.currentStep);
+    await this.ctx.storage.put("workflowStatus", this.workflowStatus);
+    this.broadcast(this.getStateMessage());
+  }
+  /**
+   * WebSocket message handler (hibernation API)
+   * Called when a client sends a message
+   */
+  async webSocketMessage(ws, _message) {
+    ws.send(JSON.stringify(this.getStateMessage()));
+  }
+  /**
+   * WebSocket close handler (hibernation API)
+   * Called when a client closes the connection
+   */
+  async webSocketClose(ws, code, reason, _wasClean) {
+    ws.close(code, reason);
+  }
+  /**
+   * Broadcast a message to all connected WebSocket clients
+   */
+  broadcast(message) {
+    const sockets = this.ctx.getWebSockets();
+    const json = JSON.stringify(message);
+    for (const socket of sockets) {
+      try {
+        socket.send(json);
+      } catch {
+      }
+    }
+  }
+  /**
+   * Get the current state as a message object
+   */
+  getStateMessage() {
+    return {
+      type: "workflow_update",
+      currentStep: this.currentStep,
+      stepStatuses: Object.fromEntries(this.stepStatuses),
+      workflowStatus: this.workflowStatus,
+      timestamp: Date.now()
+    };
+  }
+}
+const index = {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    if (url.pathname === "/api/workflow/start" && request.method === "POST") {
+      try {
+        const instance = await env.MY_WORKFLOW.create({
+          params: {
+            timestamp: Date.now()
+          }
+        });
+        return Response.json({
+          instanceId: instance.id,
+          message: "Workflow started successfully"
+        });
+      } catch {
+        return Response.json(
+          { error: "Failed to start workflow" },
+          { status: 500 }
+        );
+      }
+    }
+    if (url.pathname.startsWith("/api/workflow/status/")) {
+      const instanceId = url.pathname.split("/").pop();
+      if (!instanceId) {
+        return Response.json(
+          { error: "Instance ID required" },
+          { status: 400 }
+        );
+      }
+      try {
+        const instance = await env.MY_WORKFLOW.get(instanceId);
+        const status = await instance.status();
+        return Response.json(status);
+      } catch {
+        return Response.json(
+          { error: "Failed to get workflow status" },
+          { status: 500 }
+        );
+      }
+    }
+    if (url.pathname.startsWith("/api/workflow/event/") && request.method === "POST") {
+      const instanceId = url.pathname.split("/").pop();
+      if (!instanceId) {
+        return Response.json(
+          { error: "Instance ID required" },
+          { status: 400 }
+        );
+      }
+      try {
+        const body = await request.json();
+        const instance = await env.MY_WORKFLOW.get(instanceId);
+        await instance.sendEvent({
+          type: "user-approval",
+          payload: body
+        });
+        return Response.json({
+          success: true,
+          message: "Event sent successfully"
+        });
+      } catch {
+        return Response.json(
+          { error: "Failed to send event" },
+          { status: 500 }
+        );
+      }
+    }
+    if (url.pathname === "/ws") {
+      const instanceId = url.searchParams.get("instanceId");
+      if (!instanceId) {
+        return new Response("instanceId query parameter required", {
+          status: 400
+        });
+      }
+      const upgradeHeader = request.headers.get("Upgrade");
+      if (upgradeHeader !== "websocket") {
+        return new Response("Expected Upgrade: websocket", { status: 426 });
+      }
+      try {
+        const doId = env.WORKFLOW_STATUS.idFromName(instanceId);
+        const stub = env.WORKFLOW_STATUS.get(doId);
+        return stub.fetch(request);
+      } catch {
+        return new Response("Failed to establish WebSocket connection", {
+          status: 500
+        });
+      }
+    }
+    return Response.json({ error: "Not Found" }, { status: 404 });
+  }
+};
+const workerEntry = index ?? {};
+export {
+  MyWorkflow,
+  WorkflowStatusDO,
+  workerEntry
+};
+
+
+
 // Flashing Studio — single-file Cloudflare Worker.
 // Replace all code in the Cloudflare Worker editor with this entire file, then Deploy.
 // No imports, package installation, static-assets binding or Wrangler file required.
@@ -107,7 +348,7 @@ function summary(p) {
 })();
 
 const json=(body,status=200)=>Response.json(body,{status,headers:{'Cache-Control':'no-store'}});
-export default {
+const flashingStudio = {
   async fetch(request,env = {}){
     const url=new URL(request.url);
     if(!url.pathname.startsWith('/api/')) return serveAsset(request, url);
@@ -122,3 +363,11 @@ export default {
   }
 };
 
+
+export default {
+  async fetch(request, env, ctx) {
+    const pathname = new URL(request.url).pathname;
+    if (pathname.startsWith('/api/workflow/') || pathname === '/ws') return workerEntry.fetch(request, env, ctx);
+    return flashingStudio.fetch(request, env, ctx);
+  }
+};
