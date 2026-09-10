@@ -1,7 +1,7 @@
 {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "flashing-drawing-model",
-  "main": "worker.ts",
+  "main": "worker/index.ts",
   "compatibility_date": "2025-10-08",
   "workers_dev": true,
   "observability": { "enabled": true },
